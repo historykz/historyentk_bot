@@ -5,11 +5,7 @@ from html import escape
 from itertools import count
 from typing import Final, Optional
 
-from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -39,17 +35,18 @@ try:
         for admin_id in ADMINS_RAW.split(",")
         if admin_id.strip()
     }
-except ValueError:
-    raise ValueError("ADMINS должен содержать только числовые Telegram ID через запятую")
+except ValueError as exc:
+    raise ValueError("ADMINS должен содержать только числовые Telegram ID через запятую") from exc
+
 
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 # =========================================
-# ХРАНИЛИЩА
+# ХРАНИЛИЩА В ПАМЯТИ
 # =========================================
 
 REQUESTS: dict[int, dict] = {}
@@ -58,14 +55,14 @@ RESPONSES: dict[int, dict] = {}
 REQUEST_SEQ = count(1001)
 RESPONSE_SEQ = count(5001)
 
-# user_id -> заблокирован или нет
+# user_id -> заблокирован
 BLOCKED_USERS: set[int] = set()
 
-# user_id -> диалог завершён, пока не нажмёт /start писать нельзя
+# user_id -> диалог завершён, пока снова не нажмёт /start
 FINISHED_USERS: set[int] = set()
 
 # =========================================
-# ВСПОМОГАТЕЛЬНОЕ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =========================================
 
 def is_admin(user_id: int) -> bool:
@@ -81,7 +78,7 @@ def safe_username(user) -> str:
 def admin_name(user) -> str:
     if user.username:
         return f"@{escape(user.username)}"
-    return escape(user.first_name or "Admin")
+    return escape(user.first_name or "Администратор")
 
 
 def get_reason_title(reason_code: str) -> str:
@@ -115,19 +112,18 @@ def get_reason_text(reason_code: str) -> str:
 
 
 def reason_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔐 A) Вопрос по блокировке аккаунта", callback_data="reason:block")],
         [InlineKeyboardButton("🤝 B) Вопрос по сотрудничеству", callback_data="reason:coop")],
         [InlineKeyboardButton("🧠 C) Покупка тестов", callback_data="reason:tests")],
         [InlineKeyboardButton("📕 Д) свой вопрос", callback_data="reason:other")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
 
 def back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⬅️ Назад", callback_data="reason:back")]]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="reason:back")]
+    ])
 
 
 def user_response_keyboard(response_id: int, selected: Optional[str] = None) -> InlineKeyboardMarkup:
@@ -136,31 +132,13 @@ def user_response_keyboard(response_id: int, selected: Optional[str] = None) -> 
 
     if selected == "👍":
         left = "✅ 👍"
-    if selected == "🫶🏻":
+    elif selected == "🫶🏻":
         right = "✅ 🫶🏻"
 
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(left, callback_data=f"userreact:{response_id}:👍"),
             InlineKeyboardButton(right, callback_data=f"userreact:{response_id}:🫶🏻"),
-        ]
-    ])
-
-
-def admin_card_keyboard(request_id: int) -> InlineKeyboardMarkup:
-    req = REQUESTS[request_id]
-    like_count = len(req["admin_reactions"].get("👍", set()))
-    heart_count = len(req["admin_reactions"].get("🫶🏻", set()))
-
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✍️ Ответить", callback_data=f"reply:{request_id}")],
-        [
-            InlineKeyboardButton("✅ Завершить диалог", callback_data=f"finish:{request_id}"),
-            InlineKeyboardButton("🚫 Заблокировать", callback_data=f"block:{request_id}"),
-        ],
-        [
-            InlineKeyboardButton(f"👍 {like_count}", callback_data=f"adminreact:{request_id}:👍"),
-            InlineKeyboardButton(f"🫶🏻 {heart_count}", callback_data=f"adminreact:{request_id}:🫶🏻"),
         ]
     ])
 
@@ -182,7 +160,39 @@ def detect_message_type(message) -> str:
         return "стикер"
     if message.video_note:
         return "видеосообщение"
+    if message.animation:
+        return "GIF"
     return "другое"
+
+
+def admin_card_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    req = REQUESTS[request_id]
+    like_count = len(req["admin_reactions"].get("👍", set()))
+    heart_count = len(req["admin_reactions"].get("🫶🏻", set()))
+    user_id = req["user"]["id"]
+    is_blocked_user = user_id in BLOCKED_USERS
+
+    second_row = [
+        InlineKeyboardButton("✅ Завершить диалог", callback_data=f"finish:{request_id}")
+    ]
+
+    if is_blocked_user:
+        second_row.append(
+            InlineKeyboardButton("🔓 Разблокировать", callback_data=f"unblock:{request_id}")
+        )
+    else:
+        second_row.append(
+            InlineKeyboardButton("🚫 Заблокировать", callback_data=f"block:{request_id}")
+        )
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Ответить", callback_data=f"reply:{request_id}")],
+        second_row,
+        [
+            InlineKeyboardButton(f"👍 {like_count}", callback_data=f"adminreact:{request_id}:👍"),
+            InlineKeyboardButton(f"🫶🏻 {heart_count}", callback_data=f"adminreact:{request_id}:🫶🏻"),
+        ]
+    ])
 
 
 def build_admin_card_text(request_id: int) -> str:
@@ -196,7 +206,7 @@ def build_admin_card_text(request_id: int) -> str:
     username = f"@{escape(user['username'])}" if user.get("username") else "нет username"
     user_id = user["id"]
     reason = escape(req["reason_title"])
-    status_text = req["status_text"]
+    status_text = escape(req["status_text"])
     message_type = escape(req.get("message_type", "сообщение"))
 
     lines = [
@@ -212,40 +222,55 @@ def build_admin_card_text(request_id: int) -> str:
     ]
 
     if req.get("message_text"):
-        lines.append("")
-        lines.append("💬 Сообщение:")
-        lines.append(escape(req["message_text"]))
+        lines.extend([
+            "",
+            "💬 Сообщение:",
+            escape(req["message_text"]),
+        ])
 
     if req.get("caption"):
-        lines.append("")
-        lines.append("📝 Подпись:")
-        lines.append(escape(req["caption"]))
+        lines.extend([
+            "",
+            "📝 Подпись:",
+            escape(req["caption"]),
+        ])
 
     if req.get("voice_duration"):
-        lines.append("")
-        lines.append(f"🎤 Длительность голосового: {req['voice_duration']} сек.")
+        lines.extend([
+            "",
+            f"🎤 Длительность голосового: {req['voice_duration']} сек.",
+        ])
 
     if req.get("user_reaction"):
-        lines.append("")
-        lines.append(f"🙋 Реакция пользователя на ответ: {escape(req['user_reaction'])}")
+        lines.extend([
+            "",
+            f"🙋 Реакция пользователя на ответ: {escape(req['user_reaction'])}",
+        ])
 
     admin_reacts = req.get("admin_reactions", {})
     react_parts = []
-    if len(admin_reacts.get("👍", set())) > 0:
+    if admin_reacts.get("👍"):
         react_parts.append(f"👍 {len(admin_reacts['👍'])}")
-    if len(admin_reacts.get("🫶🏻", set())) > 0:
+    if admin_reacts.get("🫶🏻"):
         react_parts.append(f"🫶🏻 {len(admin_reacts['🫶🏻'])}")
 
     if react_parts:
-        lines.append("")
-        lines.append("🧷 Реакции админов: " + " | ".join(react_parts))
+        lines.extend([
+            "",
+            "🧷 Реакции админов: " + " | ".join(react_parts),
+        ])
 
     lines.append("</blockquote>")
 
     return "\n".join(lines)
 
 
-async def delete_message_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 5):
+async def delete_message_later(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    delay: int = 5,
+):
     try:
         await asyncio.sleep(delay)
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -254,6 +279,9 @@ async def delete_message_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
 
 
 async def refresh_admin_cards(context: ContextTypes.DEFAULT_TYPE, request_id: int):
+    if request_id not in REQUESTS:
+        return
+
     req = REQUESTS[request_id]
     text = build_admin_card_text(request_id)
     markup = admin_card_keyboard(request_id)
@@ -274,7 +302,7 @@ async def refresh_admin_cards(context: ContextTypes.DEFAULT_TYPE, request_id: in
 async def notify_admins_about_user_reaction(
     context: ContextTypes.DEFAULT_TYPE,
     request_id: int,
-    reaction: str
+    reaction: str,
 ):
     req = REQUESTS[request_id]
     user = req["user"]
@@ -294,10 +322,60 @@ async def notify_admins_about_user_reaction(
             await context.bot.send_message(
                 chat_id=admin_id,
                 text=text,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
             )
         except Exception as e:
             logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
+
+async def notify_admins_about_admin_reply(
+    context: ContextTypes.DEFAULT_TYPE,
+    request_id: int,
+    admin_user,
+    reply_text: str,
+):
+    req = REQUESTS[request_id]
+    target_user = req["user"]
+
+    admin_nick = escape(admin_user.first_name or "Администратор")
+    admin_username = f"@{escape(admin_user.username)}" if admin_user.username else "нет username"
+    target_username = (
+        f"@{escape(target_user['username'])}"
+        if target_user.get("username")
+        else f"ID {target_user['id']}"
+    )
+
+    text = (
+        "👨‍💼 <b>Ответ администратора</b>\n\n"
+        "<blockquote>"
+        f"Кто ответил: {admin_nick}\n"
+        f"Username: {admin_username}\n"
+        f"Кому ответил: {target_username}\n\n"
+        f"Текст ответа:\n{escape(reply_text or 'Медиа/вложение')}"
+        "</blockquote>"
+    )
+
+    for admin_id in ADMINS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
+
+def find_user_info_by_id(user_id: int) -> dict:
+    for req in reversed(list(REQUESTS.values())):
+        if req["user"]["id"] == user_id:
+            return req["user"]
+    return {
+        "id": user_id,
+        "username": None,
+        "first_name": "Пользователь",
+        "last_name": "",
+    }
 
 
 # =========================================
@@ -317,8 +395,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "и ваше следующее сообщение уйдёт пользователю анонимно.\n\n"
             "Команды:\n"
             "• <code>/id</code> — узнать свой ID\n"
-            "• <code>/cancel</code> — отменить режим ответа",
-            parse_mode=ParseMode.HTML
+            "• <code>/cancel</code> — отменить режим ответа\n"
+            "• <code>/banlist</code> — посмотреть банлист",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -331,12 +410,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"Здравствуйте, {safe_username(user)}!",
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
     )
 
     await update.message.reply_text(
         "Выберите причину обращения:",
-        reply_markup=reason_keyboard()
+        reply_markup=reason_keyboard(),
     )
 
 
@@ -344,7 +423,7 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"Ваш Telegram ID: <code>{user.id}</code>",
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -359,15 +438,49 @@ async def cancel_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if reply_prompt_msg_id and update.message:
         try:
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=reply_prompt_msg_id)
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=reply_prompt_msg_id,
+            )
         except Exception:
             pass
 
     await update.message.reply_text("✅ Режим ответа отменён.")
 
 
+async def banlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ Команда доступна только администраторам.")
+        return
+
+    if not BLOCKED_USERS:
+        await update.message.reply_text("✅ Банлист пуст.")
+        return
+
+    blocks = ["🚫 <b>Банлист</b>"]
+
+    for blocked_id in BLOCKED_USERS:
+        info = find_user_info_by_id(blocked_id)
+        first_name = escape(info.get("first_name") or "Пользователь")
+        username = f"@{escape(info['username'])}" if info.get("username") else "нет username"
+
+        blocks.append(
+            "<blockquote>"
+            f"👤 Имя: {first_name}\n"
+            f"🔹 Username: {username}\n"
+            f"🆔 ID: <code>{blocked_id}</code>"
+            "</blockquote>"
+        )
+
+    await update.message.reply_text(
+        "\n\n".join(blocks),
+        parse_mode=ParseMode.HTML,
+    )
+
 # =========================================
-# CALLBACK
+# CALLBACK ОБРАБОТЧИКИ
 # =========================================
 
 async def handle_reason_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -394,7 +507,7 @@ async def handle_reason_choice(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await query.edit_message_text(
             "Выберите причину обращения:",
-            reply_markup=reason_keyboard()
+            reply_markup=reason_keyboard(),
         )
         return
 
@@ -414,7 +527,7 @@ async def handle_reason_choice(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.message.reply_text(
         get_reason_text(reason_code),
-        reply_markup=back_keyboard()
+        reply_markup=back_keyboard(),
     )
 
 
@@ -446,7 +559,10 @@ async def handle_reply_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     old_prompt_id = context.user_data.pop("reply_prompt_message_id", None)
     if old_prompt_id:
         try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=old_prompt_id)
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=old_prompt_id,
+            )
         except Exception:
             pass
 
@@ -532,7 +648,7 @@ async def handle_user_reaction(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.edit_message_reply_markup(
             chat_id=query.message.chat_id,
             message_id=query.message.message_id,
-            reply_markup=user_response_keyboard(response_id, selected=reaction)
+            reply_markup=user_response_keyboard(response_id, selected=reaction),
         )
     except Exception as e:
         logger.warning(f"Не удалось обновить реакцию пользователя: {e}")
@@ -568,7 +684,7 @@ async def handle_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     BLOCKED_USERS.add(user_id)
     req["status"] = "blocked"
-    req["status_text"] = "ЗАБЛОКИРОВАН 🚫"
+    req["status_text"] = f"ЗАБЛОКИРОВАН 🚫, админом: {admin_name(admin)}"
 
     await refresh_admin_cards(context, request_id)
 
@@ -576,10 +692,50 @@ async def handle_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=user_id,
             text=f"{escape(username)}, вы заблокированы администрацией",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
     except Exception as e:
         logger.warning(f"Не удалось уведомить пользователя о блокировке: {e}")
+
+
+async def handle_unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    admin = update.effective_user
+
+    if not query:
+        return
+
+    await query.answer()
+
+    if not is_admin(admin.id):
+        return
+
+    parts = (query.data or "").split(":")
+    if len(parts) != 2:
+        return
+
+    request_id = int(parts[1])
+
+    if request_id not in REQUESTS:
+        return
+
+    req = REQUESTS[request_id]
+    user_info = req["user"]
+    user_id = user_info["id"]
+
+    BLOCKED_USERS.discard(user_id)
+    req["status"] = "unblocked"
+    req["status_text"] = f"РАЗБЛОКИРОВАН ✅, админом: {admin_name(admin)}"
+
+    await refresh_admin_cards(context, request_id)
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="✅ Вы разблокированы администрацией. Можете снова нажать /start",
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось отправить уведомление о разблокировке: {e}")
 
 
 async def handle_finish_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -619,7 +775,7 @@ async def handle_finish_dialog(update: Update, context: ContextTypes.DEFAULT_TYP
                 "Спасибо за обращение! 😊\n"
                 "Если у вас появятся дополнительные вопросы, нажмите /start, "
                 "и мы с радостью вам поможем"
-            )
+            ),
         )
     except Exception as e:
         logger.warning(f"Не удалось отправить сообщение о завершении диалога: {e}")
@@ -642,11 +798,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_user_reaction(update, context)
     elif data.startswith("block:"):
         await handle_block_user(update, context)
+    elif data.startswith("unblock:"):
+        await handle_unblock_user(update, context)
     elif data.startswith("finish:"):
         await handle_finish_dialog(update, context)
     else:
         await query.answer()
-
 
 # =========================================
 # ОБРАБОТКА СООБЩЕНИЙ
@@ -671,15 +828,30 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     req = REQUESTS[request_id]
     target_user_id = req["user"]["id"]
 
+    if target_user_id in BLOCKED_USERS:
+        warn = await message.reply_text("⛔ Пользователь заблокирован.")
+        context.application.create_task(
+            delete_message_later(context, warn.chat_id, warn.message_id, 5)
+        )
+        return
+
     text_to_send = message.text or message.caption
-    if not text_to_send and not (
-        message.effective_attachment
-        or message.voice
-        or message.photo
-        or message.document
-        or message.video
-    ):
-        await message.reply_text("❌ Отправьте текст или медиа с подписью.")
+    has_media = any([
+        message.photo,
+        message.document,
+        message.video,
+        message.voice,
+        message.audio,
+        message.video_note,
+        message.animation,
+        message.sticker,
+    ])
+
+    if not text_to_send and not has_media:
+        warn = await message.reply_text("❌ Отправьте текст или медиа с подписью.")
+        context.application.create_task(
+            delete_message_later(context, warn.chat_id, warn.message_id, 5)
+        )
         return
 
     sent_message = None
@@ -724,12 +896,22 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 caption=reply_caption,
                 parse_mode=ParseMode.HTML,
             )
+        elif message.audio:
+            sent_message = await context.bot.send_audio(
+                chat_id=target_user_id,
+                audio=message.audio.file_id,
+                caption=reply_caption,
+                parse_mode=ParseMode.HTML,
+            )
         else:
-            sent_message = await context.bot.copy_message(
+            copied = await context.bot.copy_message(
                 chat_id=target_user_id,
                 from_chat_id=message.chat_id,
                 message_id=message.message_id,
+                caption=reply_caption if text_to_send else None,
+                parse_mode=ParseMode.HTML if text_to_send else None,
             )
+            sent_message = copied
 
         response_id = next(RESPONSE_SEQ)
 
@@ -746,7 +928,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await context.bot.edit_message_reply_markup(
                     chat_id=target_user_id,
                     message_id=sent_message.message_id,
-                    reply_markup=user_response_keyboard(response_id)
+                    reply_markup=user_response_keyboard(response_id),
                 )
             except Exception as e:
                 logger.warning(f"Не удалось добавить кнопки реакции пользователю: {e}")
@@ -757,12 +939,22 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await refresh_admin_cards(context, request_id)
 
+        await notify_admins_about_admin_reply(
+            context=context,
+            request_id=request_id,
+            admin_user=admin,
+            reply_text=text_to_send or "Медиа/вложение",
+        )
+
         context.user_data.pop("reply_request_id", None)
 
         reply_prompt_msg_id = context.user_data.pop("reply_prompt_message_id", None)
         if reply_prompt_msg_id:
             try:
-                await context.bot.delete_message(chat_id=message.chat_id, message_id=reply_prompt_msg_id)
+                await context.bot.delete_message(
+                    chat_id=message.chat_id,
+                    message_id=reply_prompt_msg_id,
+                )
             except Exception:
                 pass
 
@@ -773,7 +965,10 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     except Exception as e:
         logger.exception("Ошибка при отправке ответа пользователю")
-        await message.reply_text(f"❌ Не удалось отправить сообщение.\n{e}")
+        err = await message.reply_text(f"❌ Не удалось отправить сообщение.\n{e}")
+        context.application.create_task(
+            delete_message_later(context, err.chat_id, err.message_id, 5)
+        )
 
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -802,7 +997,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not reason_selected or not reason_code or not reason_title:
         await message.reply_text(
             "⚠️ Сначала выберите причину обращения.",
-            reply_markup=reason_keyboard()
+            reply_markup=reason_keyboard(),
         )
         return
 
@@ -844,7 +1039,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             REQUESTS[request_id]["admin_message_refs"].append({
                 "chat_id": admin_id,
-                "message_id": sent.message_id
+                "message_id": sent.message_id,
             })
 
             if not message.text:
@@ -858,7 +1053,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         delete_message_later(context, ok_msg.chat_id, ok_msg.message_id, 5)
     )
 
-
 # =========================================
 # ЗАПУСК
 # =========================================
@@ -869,6 +1063,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("cancel", cancel_reply))
+    app.add_handler(CommandHandler("banlist", banlist_command))
 
     app.add_handler(CallbackQueryHandler(callback_router))
 
@@ -877,5 +1072,7 @@ def main():
 
     logger.info("Бот запущен...")
     app.run_polling()
+
+
 if __name__ == "__main__":
     main()
