@@ -38,7 +38,6 @@ try:
 except ValueError as exc:
     raise ValueError("ADMINS должен содержать только числовые Telegram ID через запятую") from exc
 
-
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     level=logging.INFO,
@@ -55,10 +54,7 @@ RESPONSES: dict[int, dict] = {}
 REQUEST_SEQ = count(1001)
 RESPONSE_SEQ = count(5001)
 
-# user_id -> заблокирован
 BLOCKED_USERS: set[int] = set()
-
-# user_id -> диалог завершён, пока снова не нажмёт /start
 FINISHED_USERS: set[int] = set()
 
 # =========================================
@@ -165,6 +161,14 @@ def detect_message_type(message) -> str:
     return "другое"
 
 
+def user_mention_html(user_info: dict) -> str:
+    if user_info.get("username"):
+        return f"@{escape(user_info['username'])}"
+    user_id = user_info["id"]
+    first_name = escape(user_info.get("first_name") or "Открыть профиль")
+    return f'<a href="tg://user?id={user_id}">{first_name}</a>'
+
+
 def admin_card_keyboard(request_id: int) -> InlineKeyboardMarkup:
     req = REQUESTS[request_id]
     like_count = len(req["admin_reactions"].get("👍", set()))
@@ -203,48 +207,57 @@ def build_admin_card_text(request_id: int) -> str:
     last_name = escape(user.get("last_name") or "")
     full_name = f"{first_name} {last_name}".strip()
 
-    username = f"@{escape(user['username'])}" if user.get("username") else "нет username"
+    if user.get("username"):
+        username_or_link = f"@{escape(user['username'])}"
+    else:
+        username_or_link = user_mention_html(user)
+
     user_id = user["id"]
     reason = escape(req["reason_title"])
     status_text = escape(req["status_text"])
     message_type = escape(req.get("message_type", "сообщение"))
 
-    lines = [
+    meta_block = (
+        "<blockquote>"
+        f"👤 Имя: {full_name}\n"
+        f"🔹 Username: {username_or_link}\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"📌 Причина: {reason}\n"
+        f"📍 Статус: {status_text}\n"
+        f"📨 Тип сообщения: {message_type}"
+        "</blockquote>"
+    )
+
+    parts = [
         "📩 <b>Новое обращение</b>",
         "",
-        "<blockquote>",
-        f"👤 Имя: {full_name}",
-        f"🔹 Username: {username}",
-        f"🆔 ID: <code>{user_id}</code>",
-        f"📌 Причина: {reason}",
-        f"📍 Статус: {status_text}",
-        f"📨 Тип сообщения: {message_type}",
+        meta_block,
     ]
 
     if req.get("message_text"):
-        lines.extend([
+        parts.extend([
             "",
-            "💬 Сообщение:",
+            "<b>💬 Сообщение:</b>",
             escape(req["message_text"]),
         ])
 
     if req.get("caption"):
-        lines.extend([
+        parts.extend([
             "",
-            "📝 Подпись:",
+            "<b>📝 Подпись:</b>",
             escape(req["caption"]),
         ])
 
     if req.get("voice_duration"):
-        lines.extend([
+        parts.extend([
             "",
-            f"🎤 Длительность голосового: {req['voice_duration']} сек.",
+            f"<b>🎤 Длительность голосового:</b> {req['voice_duration']} сек.",
         ])
 
     if req.get("user_reaction"):
-        lines.extend([
+        parts.extend([
             "",
-            f"🙋 Реакция пользователя на ответ: {escape(req['user_reaction'])}",
+            f"<b>🙋 Реакция пользователя на ответ:</b> {escape(req['user_reaction'])}",
         ])
 
     admin_reacts = req.get("admin_reactions", {})
@@ -255,14 +268,12 @@ def build_admin_card_text(request_id: int) -> str:
         react_parts.append(f"🫶🏻 {len(admin_reacts['🫶🏻'])}")
 
     if react_parts:
-        lines.extend([
+        parts.extend([
             "",
-            "🧷 Реакции админов: " + " | ".join(react_parts),
+            "<b>🧷 Реакции админов:</b> " + " | ".join(react_parts),
         ])
 
-    lines.append("</blockquote>")
-
-    return "\n".join(lines)
+    return "\n".join(parts)
 
 
 async def delete_message_later(
@@ -274,6 +285,13 @@ async def delete_message_later(
     try:
         await asyncio.sleep(delay)
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def try_delete_user_message(message):
+    try:
+        await message.delete()
     except Exception:
         pass
 
@@ -294,6 +312,7 @@ async def refresh_admin_cards(context: ContextTypes.DEFAULT_TYPE, request_id: in
                 text=text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=markup,
+                disable_web_page_preview=True,
             )
         except Exception as e:
             logger.warning(f"Не удалось обновить карточку обращения у админа {item['chat_id']}: {e}")
@@ -306,12 +325,12 @@ async def notify_admins_about_user_reaction(
 ):
     req = REQUESTS[request_id]
     user = req["user"]
-    uname = f"@{user['username']}" if user.get("username") else f"ID {user['id']}"
+    target = user_mention_html(user)
 
     text = (
         "🔔 <b>Пользователь отреагировал на ответ</b>\n\n"
         "<blockquote>"
-        f"👤 Пользователь: {escape(uname)}\n"
+        f"👤 Пользователь: {target}\n"
         f"📌 Причина: {escape(req['reason_title'])}\n"
         f"💬 Реакция: {escape(reaction)}"
         "</blockquote>"
@@ -323,6 +342,7 @@ async def notify_admins_about_user_reaction(
                 chat_id=admin_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
             )
         except Exception as e:
             logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
@@ -339,18 +359,14 @@ async def notify_admins_about_admin_reply(
 
     admin_nick = escape(admin_user.first_name or "Администратор")
     admin_username = f"@{escape(admin_user.username)}" if admin_user.username else "нет username"
-    target_username = (
-        f"@{escape(target_user['username'])}"
-        if target_user.get("username")
-        else f"ID {target_user['id']}"
-    )
+    target_user_line = user_mention_html(target_user)
 
     text = (
         "👨‍💼 <b>Ответ администратора</b>\n\n"
         "<blockquote>"
         f"Кто ответил: {admin_nick}\n"
         f"Username: {admin_username}\n"
-        f"Кому ответил: {target_username}\n\n"
+        f"Кому ответил: {target_user_line}\n\n"
         f"Текст ответа:\n{escape(reply_text or 'Медиа/вложение')}"
         "</blockquote>"
     )
@@ -361,6 +377,7 @@ async def notify_admins_about_admin_reply(
                 chat_id=admin_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
             )
         except Exception as e:
             logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
@@ -376,7 +393,6 @@ def find_user_info_by_id(user_id: int) -> dict:
         "first_name": "Пользователь",
         "last_name": "",
     }
-
 
 # =========================================
 # КОМАНДЫ
@@ -404,6 +420,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id in FINISHED_USERS:
         FINISHED_USERS.discard(user.id)
 
+    context.user_data["started"] = True
     context.user_data["reason_selected"] = False
     context.user_data.pop("reason_code", None)
     context.user_data.pop("reason_title", None)
@@ -464,12 +481,15 @@ async def banlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for blocked_id in BLOCKED_USERS:
         info = find_user_info_by_id(blocked_id)
         first_name = escape(info.get("first_name") or "Пользователь")
-        username = f"@{escape(info['username'])}" if info.get("username") else "нет username"
+        if info.get("username"):
+            username_line = f"@{escape(info['username'])}"
+        else:
+            username_line = user_mention_html(info)
 
         blocks.append(
             "<blockquote>"
             f"👤 Имя: {first_name}\n"
-            f"🔹 Username: {username}\n"
+            f"🔹 Username: {username_line}\n"
             f"🆔 ID: <code>{blocked_id}</code>"
             "</blockquote>"
         )
@@ -477,6 +497,7 @@ async def banlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\n\n".join(blocks),
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 # =========================================
@@ -517,6 +538,7 @@ async def handle_reason_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     reason_code = data.split(":", 1)[1]
     reason_title = get_reason_title(reason_code)
 
+    context.user_data["started"] = True
     context.user_data["reason_selected"] = True
     context.user_data["reason_code"] = reason_code
     context.user_data["reason_title"] = reason_title
@@ -637,6 +659,10 @@ async def handle_user_reaction(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Это не ваше сообщение", show_alert=True)
         return
 
+    if response_info.get("reaction") is not None:
+        await query.answer("Реакцию можно поставить только один раз", show_alert=True)
+        return
+
     response_info["reaction"] = reaction
     request_id = response_info["request_id"]
 
@@ -680,7 +706,11 @@ async def handle_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req = REQUESTS[request_id]
     user_info = req["user"]
     user_id = user_info["id"]
-    username = f"@{user_info['username']}" if user_info.get("username") else "Пользователь"
+
+    if user_info.get("username"):
+        username = f"@{user_info['username']}"
+    else:
+        username = user_info.get("first_name") or "Пользователь"
 
     BLOCKED_USERS.add(user_id)
     req["status"] = "blocked"
@@ -980,25 +1010,48 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if user.id in BLOCKED_USERS:
         username = f"@{user.username}" if user.username else "Пользователь"
-        await message.reply_text(f"{username}, вы заблокированы администрацией")
+        warn = await message.reply_text(f"{username}, вы заблокированы администрацией")
+        context.application.create_task(
+            delete_message_later(context, warn.chat_id, warn.message_id, 5)
+        )
+        context.application.create_task(try_delete_user_message(message))
         return
 
     if user.id in FINISHED_USERS:
-        await message.reply_text(
+        warn = await message.reply_text(
             "Диалог завершён.\n"
             "Чтобы написать снова, нажмите /start"
         )
+        context.application.create_task(
+            delete_message_later(context, warn.chat_id, warn.message_id, 5)
+        )
+        context.application.create_task(try_delete_user_message(message))
         return
 
+    started = context.user_data.get("started", False)
     reason_selected = context.user_data.get("reason_selected", False)
     reason_code = context.user_data.get("reason_code")
     reason_title = context.user_data.get("reason_title")
 
+    if not started:
+        warn = await message.reply_text(
+            "⚠️ Сначала нажмите /start, затем выберите причину обращения."
+        )
+        context.application.create_task(
+            delete_message_later(context, warn.chat_id, warn.message_id, 5)
+        )
+        context.application.create_task(try_delete_user_message(message))
+        return
+
     if not reason_selected or not reason_code or not reason_title:
-        await message.reply_text(
+        warn = await message.reply_text(
             "⚠️ Сначала выберите причину обращения.",
             reply_markup=reason_keyboard(),
         )
+        context.application.create_task(
+            delete_message_later(context, warn.chat_id, warn.message_id, 5)
+        )
+        context.application.create_task(try_delete_user_message(message))
         return
 
     request_id = next(REQUEST_SEQ)
@@ -1035,6 +1088,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 text=admin_text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=admin_markup,
+                disable_web_page_preview=True,
             )
 
             REQUESTS[request_id]["admin_message_refs"].append({
