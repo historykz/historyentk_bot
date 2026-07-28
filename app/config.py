@@ -35,6 +35,20 @@ class Settings(BaseSettings):
     CHANNEL_TITLE: str = "История Казахстана"
 
     @model_validator(mode="after")
+    def _strip_whitespace(self) -> "Settings":
+        # Guards against values that are technically non-empty (e.g. a stray space left
+        # over from editing a Variables field in a hosting dashboard) but useless — these
+        # must be treated the same as "not set", not passed through to fail deep inside a
+        # library with a cryptic traceback.
+        for field in (
+            "BOT_TOKEN", "ADMIN_IDS", "DATABASE_URL", "REDIS_URL",
+            "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB", "POSTGRES_HOST",
+            "WEBHOOK_URL",
+        ):
+            setattr(self, field, getattr(self, field).strip())
+        return self
+
+    @model_validator(mode="after")
     def _build_database_url_if_missing(self) -> "Settings":
         # If DATABASE_URL wasn't provided explicitly, assemble it from the discrete
         # POSTGRES_* variables (matches the values docker-compose passes to the "db" service).
@@ -65,6 +79,23 @@ def _load_settings() -> Settings:
     missing = [name for name in REQUIRED_VARS if not getattr(settings, name)]
     if not settings.DATABASE_URL:
         missing.append("DATABASE_URL (or POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB)")
+    elif "://" not in settings.DATABASE_URL:
+        # Non-empty but clearly not a real connection string (e.g. leftover garbage from
+        # editing the field in a hosting dashboard) — fail with a clear message instead of
+        # letting SQLAlchemy crash later with a cryptic traceback.
+        print(
+            "\n"
+            "========================================================================\n"
+            f"ОШИБКА КОНФИГУРАЦИИ: DATABASE_URL задан, но не похож на корректную ссылку:\n"
+            f"  {settings.DATABASE_URL!r}\n"
+            "\n"
+            "Ожидается что-то вроде 'postgresql+asyncpg://user:pass@host:5432/dbname'.\n"
+            "Откройте переменную DATABASE_URL в панели хостинга, очистите поле полностью\n"
+            "и заново подставьте ссылку на переменную сервиса Postgres (в Railway это\n"
+            "делается через 'Add Reference' / значок '{}', а не вводом текста руками).\n"
+            "========================================================================\n"
+        )
+        sys.exit(1)
 
     if missing:
         print(
