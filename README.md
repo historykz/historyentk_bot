@@ -1,1 +1,0 @@
-# historyentk_bot
